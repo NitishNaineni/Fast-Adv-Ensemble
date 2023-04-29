@@ -29,15 +29,32 @@ def adp_loss(inputs, targets, models, lamda, log_det_lamda, num_classes, label_s
     matrix = torch.matmul(mask_non_y_pred, mask_non_y_pred.permute(0, 2, 1))
     log_det = torch.logdet(matrix + 1e-6 * torch.eye(len(models), device=matrix.device).unsqueeze(0)).mean()
 
-    if torch.isnan(log_det):
-        print("nan in matrix: ",torch.isnan(matrix).any())
-        print("log_det",log_det)
-        print("det",torch.linalg.det(matrix))
-        import sys
-        sys.exit()
-
     log_det = log_det / len(models)**2
     loss_std = loss_std / len(models)
     loss = loss_std - lamda * ensemble_entropy - log_det_lamda * log_det
 
     return loss, torch.log(ensemble_probs)
+
+def trades_loss(inputs, adv_inputs, targets, nets, beta, lamda, log_det_lamda, num_classes, label_smoothing):
+    nat_loss, nat_outputs = adp_loss(
+        inputs,
+        targets, 
+        nets, 
+        lamda = lamda, 
+        log_det_lamda = log_det_lamda, 
+        num_classes= num_classes,
+        label_smoothing = label_smoothing
+    )
+    adv_loss, adv_outputs = adp_loss(
+        adv_inputs,
+        targets, 
+        nets, 
+        lamda = lamda, 
+        log_det_lamda = log_det_lamda, 
+        num_classes= num_classes,
+        label_smoothing = label_smoothing
+    )
+    robust_loss = F.kl_div(adv_outputs, nat_outputs, reduction='batchmean', log_target=True)
+    loss = nat_loss + adv_loss + beta * robust_loss
+
+    return loss, nat_outputs, adv_outputs

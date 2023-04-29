@@ -1,7 +1,10 @@
 # Import built-in module
 import argparse
 import warnings
+import copy
+import subprocess
 warnings.filterwarnings(action='ignore')
+subprocess.call(['sh', './cpu_setup.sh'])
 
 # Import torch
 import torch
@@ -24,16 +27,16 @@ from attack.fastattack import attack_loader
 from torch.cuda.amp import GradScaler, autocast
 
 # Import loss for ensemble training
-from utils.loss import adp_loss
+from utils.loss import trades_loss
 
 #Import composer 
 import composer.functional as cf
 
-
-
 torch.backends.cudnn.benchmark = True
 torch.autograd.profiler.emit_nvtx(False)
 torch.autograd.profiler.profile(False)
+torch.autograd.set_detect_anomaly(False)
+torch.set_flush_denormal(True)
 
 # fetch args
 parser = argparse.ArgumentParser()
@@ -68,6 +71,8 @@ parser.add_argument('--num_classes', default=10, type=int)
 
 # composer addons
 parser.add_argument('--blurpool', default=True, type=bool)
+parser.add_argument('--EMA', default=True, type=bool)
+parser.add_argument('--SAM', default=False, type=bool)
 
 
 args = parser.parse_args()
@@ -105,7 +110,7 @@ class Ensemble(nn.Module):
             return self.models[0](x)
          
 
-def train(nets, trainloader, optimizer, lr_scheduler, scaler, attack):
+def train(nets, ema_nets, trainloader, optimizer, lr_scheduler, scaler, attack):
     for net in nets:
         net.train()
         track_bn_stats(net, False)
@@ -124,33 +129,26 @@ def train(nets, trainloader, optimizer, lr_scheduler, scaler, attack):
             adv_inputs = attack(inputs, targets)
 
         # Accerlating forward propagation
-        optimizer.zero_grad()
-        nat_loss, nat_outputs = adp_loss(
-            inputs,
+        optimizer.zero_grad(set_to_none=True)
+        loss, nat_outputs, adv_outputs = trades_loss(
+            inputs, 
+            adv_inputs, 
             targets, 
-            nets, 
-            lamda = args.lamda, 
-            log_det_lamda = args.log_det_lamda, 
-            num_classes= args.num_classes,
+            nets,
+            beta = args.beta,
+            lamda = args.lamda,
+            log_det_lamda = args.log_det_lamda,
+            num_classes = args.num_classes,
             label_smoothing = args.label_smoothing
         )
-        adv_loss, adv_outputs = adp_loss(
-            adv_inputs,
-            targets, 
-            nets, 
-            lamda = args.lamda, 
-            log_det_lamda = args.log_det_lamda, 
-            num_classes= args.num_classes,
-            label_smoothing = args.label_smoothing
-        )
-        robust_loss = F.kl_div(adv_outputs, nat_outputs, reduction='batchmean', log_target=True)
-        loss = nat_loss + adv_loss + args.beta * robust_loss
-        
 
         # Accerlating backward propagation
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
+
+        for net, ema_net in zip(nets, ema_nets):
+            cf.compute_ema(net, ema_net, smoothing=0.99)
 
 
         # scheduling for Cyclic LR
@@ -267,6 +265,7 @@ def main_worker(rank, ngpus_per_node=ngpus_per_node):
 
     # init model and Distributed Data Parallel
     nets = []
+    ema_nets = []
     for i in range(args.num_models):
         net = get_network(network=args.network,
                         depth=args.depth,
@@ -279,6 +278,8 @@ def main_worker(rank, ngpus_per_node=ngpus_per_node):
         net = net.to(memory_format=torch.channels_last).cuda()
         net = torch.nn.parallel.DistributedDataParallel(net, device_ids=[rank], output_device=[rank], broadcast_buffers=False)
         nets.append(net)
+        if args.EMA:
+            ema_nets.append(copy.deepcopy(net))
 
     # fast init dataloader
     trainloader, testloader, decoder = get_fast_dataloader(dataset=args.dataset,
@@ -307,7 +308,11 @@ def main_worker(rank, ngpus_per_node=ngpus_per_node):
     parameters = []
     for net in nets:
         parameters += list(net.parameters())
-    optimizer = optim.SGD(parameters, lr=args.learning_rate, momentum=0.9, weight_decay=args.weight_decay)
+    if args.SAM:
+        base_optimizer = optim.SGD
+        optimizer = SAM(parameters, base_optimizer, lr=args.learning_rate, momentum=0.9, weight_decay=args.weight_decay)
+    else:
+        optimizer = optim.SGD(parameters, lr=args.learning_rate, momentum=0.9, weight_decay=args.weight_decay)
     lr_scheduler = torch.optim.lr_scheduler.CyclicLR(optimizer, base_lr=0, max_lr=args.learning_rate,
     step_size_up=5 * len(trainloader) if args.dataset != 'imagenet' else 2 * len(trainloader),
     step_size_down=(args.epoch - 5) * len(trainloader) if args.dataset != 'imagenet' else (args.epoch - 2) * len(trainloader))
@@ -318,8 +323,11 @@ def main_worker(rank, ngpus_per_node=ngpus_per_node):
         if args.dataset == "imagenet":
             res = get_resolution(epoch=epoch, min_res=160, max_res=192, end_ramp=25, start_ramp=18)
             decoder.output_size = (res, res)
-        train(nets, trainloader, optimizer, lr_scheduler, scaler, attack)
-        test(nets, testloader, attack, rank)
+        train(nets, ema_nets, trainloader, optimizer, lr_scheduler, scaler, attack)
+        if args.EMA:
+            test(ema_nets, testloader, attack, rank)
+        else:
+            test(nets, testloader, attack, rank)
 
     # destroy process
     dist.destroy_process_group()
