@@ -1,6 +1,9 @@
 import os
 import numpy as np
 import matplotlib.pyplot as plt
+from contextlib import contextmanager
+import torch.nn as nn
+
 
 def rprint(str, rank):
     if rank==0:
@@ -82,3 +85,26 @@ def test_robustness(net, testloader, criterion, attack_list, rank):
                     break
 
         rprint(f'{key}: {100. * correct / total:.2f}%', rank)
+
+@contextmanager
+def track_bn_stats(models: nn.Module, track_stats: bool):
+    """
+    A context manager to temporarily set the track_running_stats flag of BatchNorm layers in an list of models.
+
+    Args:
+        models (nn.Module): The list of models to modify.
+        track_stats (bool): If True, set the flag to True to track statistics during training, otherwise set it to False.
+    """
+    original_flags = {}
+
+    for model in models:
+        for module in model.modules():
+            if isinstance(module, nn.BatchNorm2d) or isinstance(module, nn.BatchNorm1d):
+                original_flags[module] = module.track_running_stats
+                module.track_running_stats = track_stats
+
+    try:
+        yield
+    finally:
+        for module, flag in original_flags.items():
+            module.track_running_stats = flag

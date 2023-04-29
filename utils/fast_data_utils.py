@@ -15,7 +15,7 @@ from ffcv.transforms.common import Squeeze
 from ffcv.writer import DatasetWriter
 
 
-def save_data_for_beton(dataset, root='../data'):
+def save_data_for_beton(dataset, root='./data'):
     if dataset == 'cifar10':
         trainset = torchvision.datasets.CIFAR10(root=root, train=True, download=True)
         testset = torchvision.datasets.CIFAR10(root=root, train=False, download=True)
@@ -59,7 +59,7 @@ def save_data_for_beton(dataset, root='../data'):
             'test': testset
         }
         for (name, ds) in datasets.items():
-            writer = DatasetWriter(f'{root}/../ffcv_data/{dataset}/{dataset}_{name}.beton', {
+            writer = DatasetWriter(f'{root}/ffcv_data/{dataset}/{dataset}_{name}.beton', {
                 'image': RGBImageField(),
                 'label': IntField(),},
                 num_workers=16)
@@ -124,8 +124,8 @@ def get_fast_dataloader(dataset, train_batch_size, test_batch_size, num_workers=
     else:
         # for small dataset
         paths = {
-            'train': f'../ffcv_data/{dataset}/{dataset}_train.beton',
-            'test': f'../ffcv_data/{dataset}/{dataset}_test.beton'
+            'train': f'./data/ffcv_data/{dataset}/{dataset}_train.beton',
+            'test': f'./data/ffcv_data/{dataset}/{dataset}_test.beton'
         }
 
         loaders = {}
