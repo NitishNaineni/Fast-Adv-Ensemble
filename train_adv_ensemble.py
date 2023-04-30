@@ -116,7 +116,6 @@ class Ensemble(nn.Module):
 def train(nets, ema_nets, trainloader, optimizer, lr_scheduler, scaler, attack):
     for net in nets:
         net.train()
-        track_bn_stats(net, False)
     train_loss = 0
     adv_correct = 0
     correct = 0
