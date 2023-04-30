@@ -2,9 +2,8 @@
 import argparse
 import warnings
 import copy
-import subprocess
+from contextlib import nullcontext
 warnings.filterwarnings(action='ignore')
-subprocess.call(['sh', './cpu_setup.sh'])
 
 # Import torch
 import torch
@@ -28,6 +27,9 @@ from torch.cuda.amp import GradScaler, autocast
 
 # Import loss for ensemble training
 from utils.loss import trades_loss
+
+# import sam optimizer
+from utils.sam import SAM
 
 #Import composer 
 import composer.functional as cf
@@ -55,7 +57,7 @@ parser.add_argument('--learning_rate', default=0.1, type=float)
 parser.add_argument('--weight_decay', default=0.0002, type=float)
 parser.add_argument('--batch_size', default=128, type=float)
 parser.add_argument('--test_batch_size', default=256, type=float)
-parser.add_argument('--epoch', default=30, type=int)
+parser.add_argument('--epoch', default=10, type=int)
 
 # attack parameter only for CIFAR-10 and SVHN
 parser.add_argument('--attack', default='pgd', type=str)
@@ -72,7 +74,7 @@ parser.add_argument('--num_classes', default=10, type=int)
 # composer addons
 parser.add_argument('--blurpool', default=True, type=bool)
 parser.add_argument('--EMA', default=True, type=bool)
-parser.add_argument('--SAM', default=False, type=bool)
+parser.add_argument('--SAM', default=True, type=bool)
 
 
 args = parser.parse_args()
@@ -91,6 +93,7 @@ best_acc = 0
 
 # Mix Training
 scaler = GradScaler()
+sam_scaler = GradScaler()
 
 class Ensemble(nn.Module):
     def __init__(self, models):
@@ -130,20 +133,41 @@ def train(nets, ema_nets, trainloader, optimizer, lr_scheduler, scaler, attack):
 
         # Accerlating forward propagation
         optimizer.zero_grad(set_to_none=True)
-        loss, nat_outputs, adv_outputs = trades_loss(
-            inputs, 
-            adv_inputs, 
-            targets, 
-            nets,
-            beta = args.beta,
-            lamda = args.lamda,
-            log_det_lamda = args.log_det_lamda,
-            num_classes = args.num_classes,
-            label_smoothing = args.label_smoothing
-        )
+
+        if args.SAM:
+            loss, _, _ = trades_loss(
+                inputs, 
+                adv_inputs, 
+                targets, 
+                nets,
+                beta = args.beta,
+                lamda = args.lamda,
+                log_det_lamda = args.log_det_lamda,
+                num_classes = args.num_classes,
+                label_smoothing = args.label_smoothing
+            )
+            sam_scaler.scale(loss).backward()
+            sam_scaler.unscale_(optimizer)
+            optimizer.first_step(zero_grad=True)
+            sam_scaler.update()
+        
+        # second forward-backward pass
+        with track_bn_stats(nets, False) if args.SAM else nullcontext():
+            loss, nat_outputs, adv_outputs = trades_loss(
+                inputs, 
+                adv_inputs, 
+                targets, 
+                nets,
+                beta = args.beta,
+                lamda = args.lamda,
+                log_det_lamda = args.log_det_lamda,
+                num_classes = args.num_classes,
+                label_smoothing = args.label_smoothing
+            )
 
         # Accerlating backward propagation
         scaler.scale(loss).backward()
+        if args.SAM: optimizer.second_step(zero_grad=True)
         scaler.step(optimizer)
         scaler.update()
 
