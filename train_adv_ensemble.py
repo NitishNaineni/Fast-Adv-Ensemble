@@ -101,6 +101,9 @@ class Ensemble(nn.Module):
         self.models = models
         assert len(self.models) > 0
 
+        for i, model in enumerate(models):
+            self.add_module('model_{}'.format(i), model)
+
     def forward(self, x):
         if len(self.models) > 1:
             outputs = 0
