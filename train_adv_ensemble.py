@@ -1,4 +1,4 @@
-# Import built-in module
+# Import built-in modules
 import argparse
 import warnings
 import copy
@@ -13,13 +13,12 @@ import torch.optim as optim
 import torch.distributed as dist
 from torch.autograd import Variable
 
-# Import Custom Utils
+# Import custom utils
 from utils.fast_network_utils import get_network
 from utils.fast_data_utils import get_fast_dataloader
 from utils.utils import *
 
-# attack loader
-# from attack.attack import attack_loader
+# Import attack loader
 from attack.fastattack import attack_loader
 
 # Accelerating forward and backward
@@ -28,22 +27,23 @@ from torch.cuda.amp import GradScaler, autocast
 # Import loss for ensemble training
 from utils.loss import trades_loss
 
-# import sam optimizer
+# Import SAM optimizer
 from utils.sam import SAM
 
-#Import composer 
+# Import composer
 import composer.functional as cf
 
+# Set global parameters for performance optimization
 torch.backends.cudnn.benchmark = True
 torch.autograd.profiler.emit_nvtx(False)
 torch.autograd.profiler.profile(False)
 torch.autograd.set_detect_anomaly(False)
 torch.set_flush_denormal(True)
 
-# fetch args
+# Fetch arguments
 parser = argparse.ArgumentParser()
 
-# model parameter
+# Model parameters
 parser.add_argument('--dataset', default='cifar10', type=str)
 parser.add_argument('--network', default='resnet', type=str)
 parser.add_argument('--depth', default=18, type=int)
@@ -52,43 +52,42 @@ parser.add_argument('--gpu', default='0', type=str)
 parser.add_argument('--port', default='12356', type=str)
 parser.add_argument('--resume', default=False, type=bool)
 
-# learning parameter
+# Learning parameters
 parser.add_argument('--learning_rate', default=0.1, type=float)
 parser.add_argument('--weight_decay', default=0.0002, type=float)
 parser.add_argument('--batch_size', default=128, type=float)
 parser.add_argument('--test_batch_size', default=256, type=float)
 parser.add_argument('--epoch', default=10, type=int)
 
-# attack parameter only for CIFAR-10 and SVHN
+# Attack parameters only for CIFAR-10 and SVHN
 parser.add_argument('--attack', default='pgd', type=str)
 parser.add_argument('--eps', default=0.03, type=float)
 parser.add_argument('--steps', default=10, type=int)
 
-# loss parameters
+# Loss parameters
 parser.add_argument('--beta', default=5.0, type=float)
 parser.add_argument('--lamda', default=0.1, type=float)
 parser.add_argument('--log_det_lamda', default=1.0, type=float)
 parser.add_argument('--label_smoothing', default=0.1, type=float)
 parser.add_argument('--num_classes', default=10, type=int)
 
-# composer addons
+# Composer addons
 parser.add_argument('--blurpool', default=True, type=bool)
 parser.add_argument('--EMA', default=True, type=bool)
 parser.add_argument('--SAM', default=True, type=bool)
 
-
 args = parser.parse_args()
 
-# the number of gpus for multi-process
+# The number of GPUs for multi-process
 gpu_list = list(map(int, args.gpu.split(',')))
 ngpus_per_node = len(gpu_list)
 
-# cuda visible devices
+# Set CUDA visible devices
 os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
 os.environ['MASTER_ADDR'] = 'localhost'
 os.environ['MASTER_PORT'] = args.port
 
-# global best_acc
+# Set global best accuracy
 best_acc = 0
 
 # Mix Training
@@ -97,26 +96,62 @@ sam_scaler = GradScaler()
 
 class Ensemble(nn.Module):
     def __init__(self, models):
+        """
+        Initializes an ensemble model given a list of models.
+
+        Args:
+        - models (list): a list of models
+        """
         super(Ensemble, self).__init__()
         self.models = models
         assert len(self.models) > 0
 
+        # Add each model as a module with a unique name
         for i, model in enumerate(models):
             self.add_module('model_{}'.format(i), model)
 
     def forward(self, x):
+        """
+        Forward pass for the ensemble model given an input.
+
+        Args:
+        - x (tensor): input data
+
+        Returns:
+        - output (tensor): log softmax of the average prediction probabilities of the ensemble models
+        """
         if len(self.models) > 1:
+            # If there are more than one models, average their prediction probabilities
             outputs = 0
             for model in self.models:
                 outputs += F.softmax(model(x), dim=-1)
             output = outputs / len(self.models)
+            # Clamp the output to prevent taking the log of zero
             output = torch.clamp(output, min=1e-40)
             return torch.log(output)
         else:
+            # If there is only one model, return its output
             return self.models[0](x)
          
 
 def train(nets, ema_nets, trainloader, optimizer, lr_scheduler, scaler, attack):
+    """
+    Trains the models on the given training data using the given optimizer, learning rate scheduler, and scaler.
+
+    Args:
+    - nets (list): a list of models
+    - ema_nets (list): a list of ema models
+    - trainloader : training data loader
+    - optimizer (torch.optim.Optimizer): optimizer
+    - lr_scheduler (torch.optim.lr_scheduler._LRScheduler): learning rate scheduler
+    - scaler (torch.cuda.amp.GradScaler): gradient scaler
+    - attack (function): function to generate adversarial examples
+
+    Returns:
+    - train_loss (float): average training loss
+    - correct (int): number of correct predictions on the original inputs
+    - adv_correct (int): number of correct predictions on the adversarial examples
+    """
     for net in nets:
         net.train()
     train_loss = 0
@@ -176,7 +211,6 @@ def train(nets, ema_nets, trainloader, optimizer, lr_scheduler, scaler, attack):
         for net, ema_net in zip(nets, ema_nets):
             cf.compute_ema(net, ema_net, smoothing=0.99)
 
-
         # scheduling for Cyclic LR
         lr_scheduler.step()
 
@@ -194,6 +228,18 @@ def train(nets, ema_nets, trainloader, optimizer, lr_scheduler, scaler, attack):
 
 
 def test(nets, testloader, attack, rank):
+    """
+    Test the model on clean and adversarial examples
+
+    Args:
+    - nets: list of models
+    - testloader: PyTorch DataLoader object
+    - attack: attack function
+    - rank: integer specifying the rank of the current process
+
+    Returns:
+    - None
+    """
     global best_acc
     for net in nets:
         net.eval()
@@ -203,13 +249,15 @@ def test(nets, testloader, attack, rank):
     desc = ('[Test/Clean] Loss: %.3f | Acc: %.3f%% (%d/%d)'
             % (test_loss/(0+1), 0, correct, total))
 
+    # Create an ensemble of the models
     ensemble = Ensemble(nets)
 
+    # Test on clean examples
     prog_bar = tqdm(enumerate(testloader), total=len(testloader), desc=desc, leave=False)
     for batch_idx, (inputs, targets) in prog_bar:
         inputs, targets = inputs.cuda(), targets.cuda()
 
-        # Accerlating forward propagation
+        # Accelerating forward propagation
         with autocast():
             outputs = ensemble(inputs)
             loss = F.cross_entropy(outputs, targets)
@@ -233,12 +281,13 @@ def test(nets, testloader, attack, rank):
     desc = ('[Test/PGD] Loss: %.3f | Acc: %.3f%%'
             % (test_loss / (0 + 1), 0))
 
+    # Test on adversarial examples
     prog_bar = tqdm(enumerate(testloader), total=len(testloader), desc=desc, leave=False)
     for batch_idx, (inputs, targets) in prog_bar:
         inputs = attack(inputs, targets)
         inputs, targets = inputs.cuda(), targets.cuda()
 
-        # Accerlating forward propagation
+        # Accelerating forward propagation
         with autocast():
             outputs = ensemble(inputs)
             loss = F.cross_entropy(outputs, targets)
@@ -260,6 +309,7 @@ def test(nets, testloader, attack, rank):
 
     rprint('Current Accuracy is {:.2f}/{:.2f}!!'.format(clean_acc, adv_acc), rank)
 
+    # Save checkpoint if this is the best accuracy achieved so far
     if acc > best_acc:
         state = {
             'nets': [net.state_dict() for net in nets],
@@ -278,6 +328,17 @@ def test(nets, testloader, attack, rank):
 
 
 def main_worker(rank, ngpus_per_node=ngpus_per_node):
+    """
+    Initialize DDP environment, model, optimizer, and scheduler
+    Perform the training and testing of the model
+
+    Args:
+    rank (int): process rank of current node
+    ngpus_per_node (int): the number of GPUs per node
+
+    Returns:
+    None
+    """
 
     # print configuration
     print_configuration(args, rank)
