@@ -100,60 +100,56 @@ class Ensemble(nn.Module):
         Initializes an ensemble model given a list of models.
 
         Args:
-        - models (list): a list of models
+        - models (list): a list of individual models to be combined in the ensemble
         """
         super(Ensemble, self).__init__()
         self.models = models
+        self.num_models = len(models)
         assert len(self.models) > 0
 
         # Add each model as a module with a unique name
         for i, model in enumerate(models):
             self.add_module('model_{}'.format(i), model)
 
-    def forward(self, x):
+    def forward(self, x, ensemble=True):
         """
         Forward pass for the ensemble model given an input.
 
         Args:
         - x (tensor): input data
+        - ensemble (bool, optional): whether to use the ensemble mode or not; default is True
 
         Returns:
-        - output (tensor): log softmax of the average prediction probabilities of the ensemble models
+        - output (tensor): log softmax of the average prediction probabilities of the ensemble models if ensemble=True,
+                           otherwise returns a tensor with outputs from each model stacked along the first dimension
         """
-        if len(self.models) > 1:
-            # If there are more than one models, average their prediction probabilities
-            outputs = 0
-            for model in self.models:
-                outputs += F.softmax(model(x), dim=-1)
-            output = outputs / len(self.models)
+        output = torch.stack([model(x) for model in self.models], dim = 0)
+        if ensemble:
+            output = F.softmax(output, dim=-1).mean(dim=0)
             # Clamp the output to prevent taking the log of zero
-            output = torch.clamp(output, min=1e-40)
-            return torch.log(output)
-        else:
-            # If there is only one model, return its output
-            return self.models[0](x)
+            output = torch.log(torch.clamp(output, min=1e-40))
+        return output
          
 
-def train(nets, ema_nets, trainloader, optimizer, lr_scheduler, scaler, attack):
+def train(ensemble, ema_ensemble, trainloader, optimizer, lr_scheduler, scaler, attack):
     """
-    Trains the models on the given training data using the given optimizer, learning rate scheduler, and scaler.
+    Trains an ensemble of models on the given training data using the specified optimizer, learning rate scheduler,
+    and gradient scaler.
 
     Args:
-    - nets (list): a list of models
-    - ema_nets (list): a list of ema models
-    - trainloader : training data loader
-    - optimizer (torch.optim.Optimizer): optimizer
-    - lr_scheduler (torch.optim.lr_scheduler._LRScheduler): learning rate scheduler
-    - scaler (torch.cuda.amp.GradScaler): gradient scaler
-    - attack (function): function to generate adversarial examples
+        ensemble : The ensemble of models to train.
+        ema_ensemble : The ensemble of EMA models.
+        trainloader : The data loader for the training data.
+        optimizer (torch.optim.Optimizer): The optimizer.
+        lr_scheduler (torch.optim.lr_scheduler._LRScheduler): The learning rate scheduler.
+        scaler (torch.cuda.amp.GradScaler): The gradient scaler.
+        attack (callable): The function to generate adversarial examples.
 
     Returns:
-    - train_loss (float): average training loss
-    - correct (int): number of correct predictions on the original inputs
-    - adv_correct (int): number of correct predictions on the adversarial examples
+        A tuple containing the average training loss (float), the number of correct predictions on the original inputs
+        (int), and the number of correct predictions on the adversarial examples (int).
     """
-    for net in nets:
-        net.train()
+    ensemble.train()
     train_loss = 0
     adv_correct = 0
     correct = 0
@@ -165,7 +161,7 @@ def train(nets, ema_nets, trainloader, optimizer, lr_scheduler, scaler, attack):
     prog_bar = tqdm(enumerate(trainloader), total=len(trainloader), desc=desc, leave=True)
     for batch_idx, (inputs, targets) in prog_bar:
         inputs, targets = inputs.cuda(), targets.cuda()
-        with track_bn_stats(nets, False):
+        with track_bn_stats(ensemble, False):
             adv_inputs = attack(inputs, targets)
 
         # Accerlating forward propagation
@@ -176,7 +172,7 @@ def train(nets, ema_nets, trainloader, optimizer, lr_scheduler, scaler, attack):
                 inputs, 
                 adv_inputs, 
                 targets, 
-                nets,
+                ensemble,
                 beta = args.beta,
                 lamda = args.lamda,
                 log_det_lamda = args.log_det_lamda,
@@ -189,12 +185,12 @@ def train(nets, ema_nets, trainloader, optimizer, lr_scheduler, scaler, attack):
             sam_scaler.update()
         
         # second forward-backward pass
-        with track_bn_stats(nets, False) if args.SAM else nullcontext():
+        with track_bn_stats(ensemble, False) if args.SAM else nullcontext():
             loss, nat_outputs, adv_outputs = trades_loss(
                 inputs, 
                 adv_inputs, 
                 targets, 
-                nets,
+                ensemble,
                 beta = args.beta,
                 lamda = args.lamda,
                 log_det_lamda = args.log_det_lamda,
@@ -208,8 +204,8 @@ def train(nets, ema_nets, trainloader, optimizer, lr_scheduler, scaler, attack):
         scaler.step(optimizer)
         scaler.update()
 
-        for net, ema_net in zip(nets, ema_nets):
-            cf.compute_ema(net, ema_net, smoothing=0.99)
+        if args.EMA:
+            cf.compute_ema(ensemble, ema_ensemble, smoothing=0.99)
 
         # scheduling for Cyclic LR
         lr_scheduler.step()
@@ -227,13 +223,13 @@ def train(nets, ema_nets, trainloader, optimizer, lr_scheduler, scaler, attack):
 
 
 
-def test(nets, testloader, attack, rank):
+def test(ensemble, testloader, attack, rank):
     """
     Test the model on clean and adversarial examples
 
     Args:
-    - nets: list of models
-    - testloader: PyTorch DataLoader object
+    - ensemble: The ensemble of models to test.
+    - testloader: DataLoader object
     - attack: attack function
     - rank: integer specifying the rank of the current process
 
@@ -241,16 +237,12 @@ def test(nets, testloader, attack, rank):
     - None
     """
     global best_acc
-    for net in nets:
-        net.eval()
+    ensemble.eval()
     test_loss = 0
     correct = 0
     total = 0
     desc = ('[Test/Clean] Loss: %.3f | Acc: %.3f%% (%d/%d)'
             % (test_loss/(0+1), 0, correct, total))
-
-    # Create an ensemble of the models
-    ensemble = Ensemble(nets)
 
     # Test on clean examples
     prog_bar = tqdm(enumerate(testloader), total=len(testloader), desc=desc, leave=False)
@@ -307,12 +299,10 @@ def test(nets, testloader, attack, rank):
     # compute acc
     acc = (clean_acc + adv_acc)/2
 
-    rprint('Current Accuracy is {:.2f}/{:.2f}!!'.format(clean_acc, adv_acc), rank)
-
     # Save checkpoint if this is the best accuracy achieved so far
     if acc > best_acc:
         state = {
-            'nets': [net.state_dict() for net in nets],
+            'ensemble': ensemble.state_dict(),
         }
         if not os.path.isdir('checkpoint'):
             os.mkdir('checkpoint')
@@ -325,6 +315,8 @@ def test(nets, testloader, attack, rank):
             print('Saving~ ./checkpoint/%s/%s_adv_%s%s_best.t7' % (args.dataset, args.dataset,
                                                                             args.network,
                                                                             args.depth))
+    
+    rprint('Test Nat Acc: {:.2f} | Adv Acc: {:.2f}'.format(clean_acc, adv_acc), rank)
 
 
 def main_worker(rank, ngpus_per_node=ngpus_per_node):
@@ -351,22 +343,25 @@ def main_worker(rank, ngpus_per_node=ngpus_per_node):
     dist.init_process_group(backend='nccl', world_size=ngpus_per_node, rank=rank)
 
     # init model and Distributed Data Parallel
-    nets = []
-    ema_nets = []
-    for i in range(args.num_models):
-        net = get_network(network=args.network,
-                        depth=args.depth,
-                        dataset=args.dataset)
+    ensemble = Ensemble(
+        [
+            get_network(
+                network=args.network,
+                depth=args.depth,
+                dataset=args.dataset
+            ) 
+            for i in range(args.num_models)
+        ]
+    )
+    # composer Algorithms
+    if args.blurpool: cf.apply_blurpool(ensemble, replace_convs=True, replace_maxpools=True, blur_first=True)
 
-        # composer Algorithms
-        if args.blurpool: cf.apply_blurpool(net, replace_convs=True, replace_maxpools=True, blur_first=True)
-
-        net = torch.nn.SyncBatchNorm.convert_sync_batchnorm(net)
-        net = net.to(memory_format=torch.channels_last).cuda()
-        net = torch.nn.parallel.DistributedDataParallel(net, device_ids=[rank], output_device=[rank], broadcast_buffers=False)
-        nets.append(net)
-        if args.EMA:
-            ema_nets.append(copy.deepcopy(net))
+    ensemble = torch.nn.SyncBatchNorm.convert_sync_batchnorm(ensemble)
+    ensemble = ensemble.to(memory_format=torch.channels_last).cuda()
+    ensemble = torch.nn.parallel.DistributedDataParallel(ensemble, device_ids=[rank], output_device=[rank], broadcast_buffers=False)
+    ensemble.num_models = args.num_models
+    if args.EMA:
+        ema_ensemble = copy.deepcopy(ensemble)
 
     # fast init dataloader
     trainloader, testloader, decoder = get_fast_dataloader(dataset=args.dataset,
@@ -377,13 +372,11 @@ def main_worker(rank, ngpus_per_node=ngpus_per_node):
     if args.resume:
         checkpoint_name = './checkpoint/%s/%s_%s%s_best.t7' % (args.dataset, args.dataset, args.network, args.depth)
         checkpoint = torch.load(checkpoint_name, map_location=torch.device(torch.cuda.current_device()))
-        for i in range(args.num_models):
-            nets[i].load_state_dict(checkpoint['nets'][i])
+        ensemble.load_state_dict(checkpoint['ensemble'])
         rprint(f'==> {checkpoint_name}', rank)
         rprint('==> Successfully Loaded Standard checkpoint..', rank)
 
     # Attack loader
-    ensemble = Ensemble(nets)
     if args.dataset == 'imagenet' or args.dataset == 'tiny':
         rprint('Fast FGSM training', rank)
         attack = attack_loader(net=ensemble, attack='fgsm_train', eps=2/255 if args.dataset == 'imagenet' else 0.03, steps=args.steps)
@@ -392,14 +385,10 @@ def main_worker(rank, ngpus_per_node=ngpus_per_node):
         attack = attack_loader(net=ensemble, attack=args.attack, eps=args.eps, steps=args.steps)
 
     # init optimizer and lr scheduler
-    parameters = []
-    for net in nets:
-        parameters += list(net.parameters())
     if args.SAM:
-        base_optimizer = optim.SGD
-        optimizer = SAM(parameters, base_optimizer, lr=args.learning_rate, momentum=0.9, weight_decay=args.weight_decay)
+        optimizer = SAM(ensemble.parameters(), optim.SGD, lr=args.learning_rate, momentum=0.9, weight_decay=args.weight_decay)
     else:
-        optimizer = optim.SGD(parameters, lr=args.learning_rate, momentum=0.9, weight_decay=args.weight_decay)
+        optimizer = optim.SGD(ensemble.parameters(), lr=args.learning_rate, momentum=0.9, weight_decay=args.weight_decay)
     lr_scheduler = torch.optim.lr_scheduler.CyclicLR(optimizer, base_lr=0, max_lr=args.learning_rate,
     step_size_up=5 * len(trainloader) if args.dataset != 'imagenet' else 2 * len(trainloader),
     step_size_down=(args.epoch - 5) * len(trainloader) if args.dataset != 'imagenet' else (args.epoch - 2) * len(trainloader))
@@ -410,11 +399,11 @@ def main_worker(rank, ngpus_per_node=ngpus_per_node):
         if args.dataset == "imagenet":
             res = get_resolution(epoch=epoch, min_res=160, max_res=192, end_ramp=25, start_ramp=18)
             decoder.output_size = (res, res)
-        train(nets, ema_nets, trainloader, optimizer, lr_scheduler, scaler, attack)
+        train(ensemble, ema_ensemble, trainloader, optimizer, lr_scheduler, scaler, attack)
         if args.EMA:
-            test(ema_nets, testloader, attack, rank)
+            test(ema_ensemble, testloader, attack, rank)
         else:
-            test(nets, testloader, attack, rank)
+            test(ensemble, testloader, attack, rank)
 
     # destroy process
     dist.destroy_process_group()

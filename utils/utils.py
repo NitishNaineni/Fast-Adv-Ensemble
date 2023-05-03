@@ -87,21 +87,20 @@ def test_robustness(net, testloader, criterion, attack_list, rank):
         rprint(f'{key}: {100. * correct / total:.2f}%', rank)
 
 @contextmanager
-def track_bn_stats(models: nn.Module, track_stats: bool):
+def track_bn_stats(ensemble, track_stats):
     """
-    A context manager to temporarily set the track_running_stats flag of BatchNorm layers in an list of models.
+    A context manager to temporarily set the track_running_stats flag of BatchNorm layers in a given ensemble of models.
 
     Args:
-        models (nn.Module): The list of models to modify.
+        ensemble : The ensemble of models to modify.
         track_stats (bool): If True, set the flag to True to track statistics during training, otherwise set it to False.
     """
     original_flags = {}
 
-    for model in models:
-        for module in model.modules():
-            if isinstance(module, nn.BatchNorm2d) or isinstance(module, nn.BatchNorm1d):
-                original_flags[module] = module.track_running_stats
-                module.track_running_stats = track_stats
+    for module in ensemble.modules():
+        if isinstance(module, (nn.BatchNorm2d, nn.BatchNorm1d)):
+            original_flags[module] = module.track_running_stats
+            module.track_running_stats = track_stats
 
     try:
         yield
