@@ -260,3 +260,4 @@ dependencies:
       - ffcv==1.0.2
       - pytorch-pfn-extras==0.6.6
       - torchattacks==3.1.0
+      - wget==3.2
