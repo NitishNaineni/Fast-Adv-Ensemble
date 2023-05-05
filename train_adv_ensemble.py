@@ -3,6 +3,7 @@ import argparse
 import warnings
 import copy
 from contextlib import nullcontext
+from typing import Optional
 warnings.filterwarnings(action='ignore')
 
 # Import torch
@@ -12,6 +13,10 @@ import torch.nn.functional as F
 import torch.optim as optim
 import torch.distributed as dist
 from torch.autograd import Variable
+from torch.func import functional_call, stack_module_state, replace_all_batch_norm_modules_
+from torch import vmap, Tensor
+from torch.nn import Parameter
+from torch.nn.modules.module import _global_parameter_registration_hooks, _global_buffer_registration_hooks
 
 # Import custom utils
 from utils.fast_network_utils import get_network
@@ -74,7 +79,7 @@ parser.add_argument('--num_classes', default=10, type=int)
 # Composer addons
 parser.add_argument('--blurpool', default=True, type=bool)
 parser.add_argument('--EMA', default=True, type=bool)
-parser.add_argument('--SAM', default=True, type=bool)
+parser.add_argument('--SAM', default=False, type=bool)
 
 args = parser.parse_args()
 
@@ -103,13 +108,106 @@ class Ensemble(nn.Module):
         - models (list): a list of individual models to be combined in the ensemble
         """
         super(Ensemble, self).__init__()
-        self.models = models
+        params, buffers = stack_module_state(models)
         self.num_models = len(models)
-        assert len(self.models) > 0
+        self.base_model = copy.deepcopy(models[0])
+
+        # Rename the parameters and buffers of the base_model
+        # param_names = []
+        # for name, param in self.base_model.named_parameters():
+        #     updated_name = name.replace('.', '_')
+        #     param_names.append(name)
+        #     self.base_model.register_parameter(updated_name, param)
+
+        # for name in param_names:
+        #     del self.base_model._parameters[name]
+
+        # # Rename buffers
+        # buffer_names = []
+        # for name, buffer in self.base_model.named_buffers():
+        #     updated_name = name.replace('.', '_')
+        #     buffer_names.append(name)
+        #     self.base_model.register_buffer(updated_name, buffer)
+
+        # for name in buffer_names:
+        #     del self.base_model._buffers[name]
+
+        # Register stacked parameters and buffers
+        self.params = {}
+        self.buffers = {}
+        for name, param in params.items():
+            # updated_name = name.replace('.', '_')
+            self.register_parameter(name, nn.Parameter(param))
+            self.params[name] = param
+        for name, buffer in buffers.items():
+            # updated_name = name.replace('.', '_')
+            self.register_buffer(name, buffer)
+            self.buffers[name] = buffer
 
         # Add each model as a module with a unique name
-        for i, model in enumerate(models):
-            self.add_module('model_{}'.format(i), model)
+        # for i, model in enumerate(models):
+        #     self.add_module('model_{}'.format(i), model)
+    
+    def register_parameter(self, name: str, param: Optional[Parameter]) -> None:
+        if '_parameters' not in self.__dict__:
+            raise AttributeError(
+                "cannot assign parameter before Module.__init__() call")
+
+        elif not isinstance(name, str):
+            raise TypeError("parameter name should be a string. "
+                            "Got {}".format(torch.typename(name)))
+        elif name == '':
+            raise KeyError("parameter name can't be empty string \"\"")
+        elif hasattr(self, name) and name not in self._parameters:
+            raise KeyError("attribute '{}' already exists".format(name))
+
+        if param is None:
+            self._parameters[name] = None
+        elif not isinstance(param, Parameter):
+            raise TypeError("cannot assign '{}' object to parameter '{}' "
+                            "(torch.nn.Parameter or None required)"
+                            .format(torch.typename(param), name))
+        elif param.grad_fn:
+            raise ValueError(
+                "Cannot assign non-leaf Tensor to parameter '{0}'. Model "
+                "parameters must be created explicitly. To express '{0}' "
+                "as a function of another Tensor, compute the value in "
+                "the forward() method.".format(name))
+        else:
+            for hook in _global_parameter_registration_hooks.values():
+                output = hook(self, name, param)
+                if output is not None:
+                    param = output
+            self._parameters[name] = param
+
+    def register_buffer(self, name: str, tensor: Optional[Tensor], persistent: bool = True) -> None:
+        if persistent is False and isinstance(self, torch.jit.ScriptModule):
+            raise RuntimeError("ScriptModule does not support non-persistent buffers")
+
+        if '_buffers' not in self.__dict__:
+            raise AttributeError(
+                "cannot assign buffer before Module.__init__() call")
+        elif not isinstance(name, str):
+            raise TypeError("buffer name should be a string. "
+                            "Got {}".format(torch.typename(name)))
+        elif name == '':
+            raise KeyError("buffer name can't be empty string \"\"")
+        elif hasattr(self, name) and name not in self._buffers:
+            raise KeyError("attribute '{}' already exists".format(name))
+        elif tensor is not None and not isinstance(tensor, torch.Tensor):
+            raise TypeError("cannot assign '{}' object to buffer '{}' "
+                            "(torch Tensor or None required)"
+                            .format(torch.typename(tensor), name))
+        else:
+            for hook in _global_buffer_registration_hooks.values():
+                output = hook(self, name, tensor)
+                if output is not None:
+                    tensor = output
+            self._buffers[name] = tensor
+            if persistent:
+                self._non_persistent_buffers_set.discard(name)
+            else:
+                self._non_persistent_buffers_set.add(name)
 
     def forward(self, x, ensemble=True):
         """
@@ -123,7 +221,9 @@ class Ensemble(nn.Module):
         - output (tensor): log softmax of the average prediction probabilities of the ensemble models if ensemble=True,
                            otherwise returns a tensor with outputs from each model stacked along the first dimension
         """
-        output = torch.stack([model(x) for model in self.models], dim = 0)
+        def fmodel(params, buffers, minibatch):
+            return functional_call(self.base_model, (params, buffers), (minibatch,))
+        output = vmap(fmodel, in_dims=(0, 0, None))(self.params, self.buffers, x)
         if ensemble:
             output = F.softmax(output, dim=-1).mean(dim=0)
             # Clamp the output to prevent taking the log of zero
@@ -343,21 +443,19 @@ def main_worker(rank, ngpus_per_node=ngpus_per_node):
     dist.init_process_group(backend='nccl', world_size=ngpus_per_node, rank=rank)
 
     # init model and Distributed Data Parallel
-    ensemble = Ensemble(
-        [
-            get_network(
-                network=args.network,
-                depth=args.depth,
-                dataset=args.dataset
-            ) 
-            for i in range(args.num_models)
-        ]
-    )
-    # composer Algorithms
-    if args.blurpool: cf.apply_blurpool(ensemble, replace_convs=True, replace_maxpools=True, blur_first=True)
+    def generate_net():
+        net = get_network(network=args.network,depth=args.depth,dataset=args.dataset)
+        if args.blurpool: cf.apply_blurpool(net, replace_convs=True, replace_maxpools=True, blur_first=True)
+        net = torch.nn.SyncBatchNorm.convert_sync_batchnorm(net)
+        net = net.to(memory_format=torch.channels_last).cuda()
+        return net
 
-    ensemble = torch.nn.SyncBatchNorm.convert_sync_batchnorm(ensemble)
-    ensemble = ensemble.to(memory_format=torch.channels_last).cuda()
+    nets = []
+
+    for i in range(args.num_models):
+        nets.append(generate_net())
+    ensemble = Ensemble(nets)
+    
     ensemble = torch.nn.parallel.DistributedDataParallel(ensemble, device_ids=[rank], output_device=[rank], broadcast_buffers=False)
     ensemble.num_models = args.num_models
     if args.EMA:
