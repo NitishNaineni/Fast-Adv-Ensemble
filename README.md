@@ -3,6 +3,7 @@
 for some of the dependecies gcc is needed. run `sudo apt install build-essential` if gcc isnt installed
 ```
 conda env create -f environment.yml
+conda activate adv
 ```
 ### Data preperation
 ```
