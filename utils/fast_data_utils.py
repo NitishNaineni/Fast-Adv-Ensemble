@@ -54,7 +54,7 @@ class Normalize_and_Convert(Operation):
     def declare_state_and_memory(self, previous_state: State) -> Tuple[State, Optional[AllocationQuery]]:
         return replace(previous_state, dtype=self.target_dtype), None
 
-def get_fast_dataloader(dataset, train_batch_size, test_batch_size, num_workers=20, dist=True):
+def get_fast_dataloader(dataset, train_batch_size, test_batch_size, num_workers=16, dist=True):
 
     gpu = f'cuda:{torch.cuda.current_device()}'
 

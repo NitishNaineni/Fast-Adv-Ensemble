@@ -1,10 +1,11 @@
 import wget
 import os
 import torch
-import torchvision
+from torchvision.datasets import CIFAR10, CIFAR100
 import numpy as np
 from ffcv.writer import DatasetWriter
 from ffcv.fields import RGBImageField, IntField
+from torch.utils.data import Dataset
 
 
 CIFAR10_URL = "https://huggingface.co/datasets/P2333/DM-Improves-AT/resolve/main/cifar10/1m.npz"
@@ -14,85 +15,33 @@ AUX_PATH = "./data/aux_data/"
 BASE_PATH = "./data/base_data/"
 FFCV_PATH = "./data/ffcv_data/"
 
-class SemiSupervisedDataset(torch.utils.data.Dataset):
-    """
-    A dataset with auxiliary pseudo-labeled data.
-    """
-    def __init__(self, aux_data_filename=None, train=False, **kwargs):
-
-        self.load_base_dataset(train, **kwargs)
-        
-        self.train = train
-
-        if self.train:
-            if aux_data_filename is not None:
-                aux_path = aux_data_filename
-                aux = np.load(aux_path)
-                aux_data = aux['image']
-                aux_targets = aux['label']
-                orig_len = len(self.data)
-
-                self.data = np.concatenate((self.data, aux_data), axis=0)
-                self.targets.extend(aux_targets)
+class AuxDataset(Dataset):
+    def __init__(self, aux_path):
+        data = np.load(aux_path)
+        self.images = data["image"]
+        self.labels = data["label"]
     
-    def load_base_dataset(self, **kwargs):
-        raise NotImplementedError()
-    
-    @property
-    def data(self):
-        return self.dataset.data
-
-    @data.setter
-    def data(self, value):
-        self.dataset.data = value
-
-    @property
-    def targets(self):
-        return self.dataset.targets
-
-    @targets.setter
-    def targets(self, value):
-        self.dataset.targets = value
-
     def __len__(self):
-        return len(self.dataset)
-
-    def __getitem__(self, item):
-        self.dataset.labels = self.targets
-        return self.dataset[item]
-
-
-class SemiSupervisedCIFAR10(SemiSupervisedDataset):
-    """
-    A dataset with auxiliary pseudo-labeled data for CIFAR10.
-    """
-    def load_base_dataset(self, train=False, **kwargs):
-        self.dataset = torchvision.datasets.CIFAR10(train=train, **kwargs)
-        self.dataset_size = len(self.dataset)
-
-
-def load_cifar10(data_dir, cifar10_aux_path):
-    download_data(cifar10_aux_path, CIFAR10_URL)
-    train_dataset = SemiSupervisedCIFAR10(root=data_dir, train=True, download=True,aux_data_filename=cifar10_aux_path)
-    test_dataset = SemiSupervisedCIFAR10(root=data_dir, train=False, download=True)
+        return len(self.images)
     
-    return train_dataset, test_dataset
-
-class SemiSupervisedCIFAR100(SemiSupervisedDataset):
-    """
-    A dataset with auxiliary pseudo-labeled data for CIFAR100.
-    """
-    def load_base_dataset(self, train=False, **kwargs):
-        self.dataset = torchvision.datasets.CIFAR100(train=train, **kwargs)
-        self.dataset_size = len(self.dataset)
+    def __getitem__(self, index):
+        image = self.images[index]
+        label = self.labels[index]
+        return image, label
 
 
-def load_cifar100(data_dir, cifar100_aux_path):
-    download_data(cifar100_aux_path, CIFAR100_URL)
-    train_dataset = SemiSupervisedCIFAR100(root=data_dir, train=True, download=True,aux_data_filename=cifar100_aux_path)
-    test_dataset = SemiSupervisedCIFAR100(root=data_dir, train=False, download=True)
-    
-    return train_dataset, test_dataset
+def load_dataset(dataset_name, data_dir = None, aux_path = None, aux_url = None, dataset = None):
+    if dataset_name == "train":
+        dataset = dataset(root=data_dir, train=True, download=True)
+    elif dataset_name == "test":
+        dataset = dataset(root=data_dir, train=False, download=True)
+    elif dataset_name == "aux":
+        download_data(aux_path, aux_url)
+        dataset = AuxDataset(aux_path)
+    else:
+        raise Exception(f"{dataset_name} is not supported")
+    return dataset
+
 
 def download_data(aux_path, url):
     """
@@ -145,21 +94,35 @@ def process(dataset_name):
     base_path = path_maker(BASE_PATH, dataset_name, "")
     ffcv_train_path = path_maker(FFCV_PATH, dataset_name, "train.beton")
     ffcv_test_path = path_maker(FFCV_PATH, dataset_name, "test.beton")
+    ffcv_aux_path = path_maker(FFCV_PATH, dataset_name, "aux.beton")
 
     if aux_path is None or base_path is None or ffcv_train_path is None or ffcv_test_path is None:
         print(f"Error processing {dataset_name}.")
         return
 
+
     if dataset_name == "cifar10":
-        trainset, testset = load_cifar10(base_path, aux_path)
+        dataset = CIFAR10
+        aux_url = CIFAR10_URL
+        
     elif dataset_name == "cifar100":
-        trainset, testset = load_cifar100(base_path, aux_path)
+        dataset = CIFAR100
+        aux_url = CIFAR100_URL
     else:
         print("Only cifar10 and cifar100 datasets are supported.")
         return
 
+    trainset = load_dataset("train", data_dir=base_path, dataset=dataset)
     write(trainset, ffcv_train_path)
+    del trainset
+
+    testset = load_dataset("test", data_dir=base_path, dataset=dataset)
     write(testset, ffcv_test_path)
+    del testset
+
+    auxset = load_dataset("aux", aux_path=aux_path, aux_url=aux_url)
+    write(auxset, ffcv_aux_path)
+    del auxset
 
 
 def main():
