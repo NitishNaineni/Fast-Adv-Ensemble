@@ -4,7 +4,7 @@ conda env create -f environment.yml
 ```
 ## Data
 ```
-python fast_dataset_converter.py
+python prepare_data.py
 ```
 ## Training
 ```
