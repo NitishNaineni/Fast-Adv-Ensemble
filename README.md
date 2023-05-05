@@ -1,9 +1,8 @@
 ## Requirements 
 ### Environment setup
-ffcv need gcc to build. run `sudo apt install build-essential` if gcc isnt installed
-
-opencv need libgl1-mesa-glx. run `sudo apt-get install libgl1-mesa-glx` if not installed
 ```
+sudo apt-get update
+sudo apt-get install build-essential libgl1-mesa-glx
 conda env create -f environment.yml
 conda activate adv
 ```
