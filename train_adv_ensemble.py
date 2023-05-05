@@ -364,7 +364,7 @@ def main_worker(rank, ngpus_per_node=ngpus_per_node):
         ema_ensemble = copy.deepcopy(ensemble)
 
     # fast init dataloader
-    trainloader, testloader, decoder = get_fast_dataloader(dataset=args.dataset,
+    trainloader, testloader = get_fast_dataloader(dataset=args.dataset,
                                                   train_batch_size=args.batch_size,
                                                   test_batch_size=args.test_batch_size)
 
@@ -377,28 +377,25 @@ def main_worker(rank, ngpus_per_node=ngpus_per_node):
         rprint('==> Successfully Loaded Standard checkpoint..', rank)
 
     # Attack loader
-    if args.dataset == 'imagenet' or args.dataset == 'tiny':
-        rprint('Fast FGSM training', rank)
-        attack = attack_loader(net=ensemble, attack='fgsm_train', eps=2/255 if args.dataset == 'imagenet' else 0.03, steps=args.steps)
-    else:
-        rprint('PGD training', rank)
-        attack = attack_loader(net=ensemble, attack=args.attack, eps=args.eps, steps=args.steps)
+    rprint('PGD training', rank)
+    attack = attack_loader(net=ensemble, attack=args.attack, eps=args.eps, steps=args.steps)
 
     # init optimizer and lr scheduler
     if args.SAM:
         optimizer = SAM(ensemble.parameters(), optim.SGD, lr=args.learning_rate, momentum=0.9, weight_decay=args.weight_decay)
     else:
         optimizer = optim.SGD(ensemble.parameters(), lr=args.learning_rate, momentum=0.9, weight_decay=args.weight_decay)
-    lr_scheduler = torch.optim.lr_scheduler.CyclicLR(optimizer, base_lr=0, max_lr=args.learning_rate,
-    step_size_up=5 * len(trainloader) if args.dataset != 'imagenet' else 2 * len(trainloader),
-    step_size_down=(args.epoch - 5) * len(trainloader) if args.dataset != 'imagenet' else (args.epoch - 2) * len(trainloader))
+    lr_scheduler = torch.optim.lr_scheduler.CyclicLR(
+        optimizer, 
+        base_lr=0, 
+        max_lr=args.learning_rate,
+        step_size_up=5 * len(trainloader),
+        step_size_down=(args.epoch - 5) * len(trainloader)
+    )
 
     # training and testing
     for epoch in range(args.epoch):
         rprint('\nEpoch: %d' % epoch, rank)
-        if args.dataset == "imagenet":
-            res = get_resolution(epoch=epoch, min_res=160, max_res=192, end_ramp=25, start_ramp=18)
-            decoder.output_size = (res, res)
         train(ensemble, ema_ensemble, trainloader, optimizer, lr_scheduler, scaler, attack)
         if args.EMA:
             test(ema_ensemble, testloader, attack, rank)
