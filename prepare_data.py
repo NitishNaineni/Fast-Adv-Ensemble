@@ -64,7 +64,9 @@ def write(dataset, path):
     else:
         print(f"Writing FFCV dataset to {path}")
         writer = DatasetWriter(path, {
-            'image': RGBImageField(),
+            'image': RGBImageField(
+                write_mode='raw'
+            ),
             'label': IntField()
         })
         writer.from_indexed_dataset(dataset)

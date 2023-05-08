@@ -54,7 +54,7 @@ class Normalize_and_Convert(Operation):
     def declare_state_and_memory(self, previous_state: State) -> Tuple[State, Optional[AllocationQuery]]:
         return replace(previous_state, dtype=self.target_dtype), None
 
-def get_fast_dataloader(dataset, train_batch_size, test_batch_size, num_workers=16, dist=True):
+def get_fast_dataloader(dataset, train_batch_size, test_batch_size, unsup_fraction, dist=True):
 
     gpu = f'cuda:{torch.cuda.current_device()}'
 
@@ -70,14 +70,31 @@ def get_fast_dataloader(dataset, train_batch_size, test_batch_size, num_workers=
     # for small dataset
     paths = {
         'train': f'./data/ffcv_data/{dataset}/train.beton',
-        'test': f'./data/ffcv_data/{dataset}/test.beton'
+        'test': f'./data/ffcv_data/{dataset}/test.beton',
+        'aux': f'./data/ffcv_data/{dataset}/aux.beton'
     }
 
+    aux_batch_size = int(train_batch_size * unsup_fraction)
+    train_batch_size = train_batch_size - aux_batch_size
+
+    batch_size = {
+        'train': train_batch_size,
+        'test': test_batch_size,
+        'aux': aux_batch_size,
+    }
+
+    order = {
+        'train': OrderOption.RANDOM,
+        'test': OrderOption.SEQUENTIAL,
+        'aux': OrderOption.RANDOM
+    }
+
+
     loaders = {}
-    for name in ['train', 'test']:
+    for name in ['train', 'test', 'aux']:
         image_pipeline: List[Operation] = [SimpleRGBImageDecoder()]
         label_pipeline: List[Operation] = [IntDecoder(), ToTensor(), ToDevice_modified(torch.device(gpu)), Squeeze()]
-        if name == 'train':
+        if name != 'test':
             image_pipeline.extend([
                 RandomHorizontalFlip(),
                 RandomTranslate(padding=int(img_size / 8.), fill=tuple(map(int, mean))),
@@ -89,11 +106,16 @@ def get_fast_dataloader(dataset, train_batch_size, test_batch_size, num_workers=
             Normalize_and_Convert(torch.float16, True)
         ])
 
-        order = OrderOption.RANDOM if name == 'train' else OrderOption.SEQUENTIAL
+        loaders[name] = Loader(
+            paths[name], 
+            batch_size= batch_size[name],  
+            num_workers=16,
+            os_cache=True,
+            distributed=dist,
+            order=order[name], 
+            drop_last=(name == 'train'),
+            pipelines={'image': image_pipeline, 'label': label_pipeline}
+        )
 
-        loaders[name] = Loader(paths[name], batch_size=train_batch_size if name == 'train' else test_batch_size,
-                            num_workers=num_workers, order=order, drop_last=(name == 'train'),
-                                pipelines={'image': image_pipeline, 'label': label_pipeline})
 
-
-    return loaders['train'], loaders['test']
+    return loaders['train'], loaders['test'], loaders['aux']

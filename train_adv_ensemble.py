@@ -44,7 +44,7 @@ torch.set_flush_denormal(True)
 parser = argparse.ArgumentParser()
 
 # Model parameters
-parser.add_argument('--dataset', default='cifar10', type=str)
+parser.add_argument('--dataset', default='cifar100', type=str)
 parser.add_argument('--network', default='resnet', type=str)
 parser.add_argument('--depth', default=18, type=int)
 parser.add_argument('--num_models', default=3, type=int)
@@ -58,8 +58,9 @@ parser.add_argument('--weight_decay', default=0.0002, type=float)
 parser.add_argument('--batch_size', default=128, type=float)
 parser.add_argument('--test_batch_size', default=256, type=float)
 parser.add_argument('--epoch', default=10, type=int)
+parser.add_argument('--unsup_fraction', default=0.7, type=float)
 
-# Attack parameters only for CIFAR-10 and SVHN
+# Attack parameters
 parser.add_argument('--attack', default='pgd', type=str)
 parser.add_argument('--eps', default=0.03, type=float)
 parser.add_argument('--steps', default=10, type=int)
@@ -69,7 +70,6 @@ parser.add_argument('--beta', default=5.0, type=float)
 parser.add_argument('--lamda', default=0.1, type=float)
 parser.add_argument('--log_det_lamda', default=1.0, type=float)
 parser.add_argument('--label_smoothing', default=0.1, type=float)
-parser.add_argument('--num_classes', default=10, type=int)
 
 # Composer addons
 parser.add_argument('--blurpool', default=True, type=bool)
@@ -77,6 +77,15 @@ parser.add_argument('--EMA', default=True, type=bool)
 parser.add_argument('--SAM', default=True, type=bool)
 
 args = parser.parse_args()
+
+if args.dataset == 'cifar10':
+    args.num_classes = 10
+elif args.dataset == 'cifar100':
+    args.num_classes = 100
+else:
+    Exception(f'{args.dataset} isnt supported')
+
+CHECKPOINT_PATH = "./checkpoint/"
 
 # The number of GPUs for multi-process
 gpu_list = list(map(int, args.gpu.split(',')))
@@ -131,7 +140,7 @@ class Ensemble(nn.Module):
         return output
          
 
-def train(ensemble, ema_ensemble, trainloader, optimizer, lr_scheduler, scaler, attack):
+def train(ensemble, ema_ensemble, trainloader, auxloader, optimizer, lr_scheduler, scaler, attack):
     """
     Trains an ensemble of models on the given training data using the specified optimizer, learning rate scheduler,
     and gradient scaler.
@@ -140,6 +149,7 @@ def train(ensemble, ema_ensemble, trainloader, optimizer, lr_scheduler, scaler, 
         ensemble : The ensemble of models to train.
         ema_ensemble : The ensemble of EMA models.
         trainloader : The data loader for the training data.
+        auxloader : The data loader for the aux data.
         optimizer (torch.optim.Optimizer): The optimizer.
         lr_scheduler (torch.optim.lr_scheduler._LRScheduler): The learning rate scheduler.
         scaler (torch.cuda.amp.GradScaler): The gradient scaler.
@@ -155,12 +165,14 @@ def train(ensemble, ema_ensemble, trainloader, optimizer, lr_scheduler, scaler, 
     correct = 0
     total = 0
 
-    desc = ('[Train/LR=%.3f] Loss: %.3f | Acc: %.3f%%' %
-            (lr_scheduler.get_lr()[0], 0, 0))
+    desc = ('[Train/LR=%.3f] Loss: %.3f | Acc: %.3f%% | Adv Acc: %.3f%%' %
+            (lr_scheduler.get_lr()[0], 0, 0, 0))
 
-    prog_bar = tqdm(enumerate(trainloader), total=len(trainloader), desc=desc, leave=True)
-    for batch_idx, (inputs, targets) in prog_bar:
-        inputs, targets = inputs.cuda(), targets.cuda()
+    prog_bar = tqdm(enumerate(zip(trainloader, auxloader)), total=len(trainloader), desc=desc, leave=True)
+    for batch_idx, ((inputs1, targets1), (inputs2, targets2)) in prog_bar:
+        # Combine the batches from both DataLoaders
+        inputs = torch.cat((inputs1, inputs2), dim=0).cuda()
+        targets = torch.cat((targets1, targets2), dim=0).cuda() 
         with track_bn_stats(ensemble, False):
             adv_inputs = attack(inputs, targets)
 
@@ -364,9 +376,12 @@ def main_worker(rank, ngpus_per_node=ngpus_per_node):
         ema_ensemble = copy.deepcopy(ensemble)
 
     # fast init dataloader
-    trainloader, testloader = get_fast_dataloader(dataset=args.dataset,
-                                                  train_batch_size=args.batch_size,
-                                                  test_batch_size=args.test_batch_size)
+    trainloader, testloader, auxloader = get_fast_dataloader(
+        dataset=args.dataset,
+        train_batch_size=args.batch_size,
+        test_batch_size=args.test_batch_size,
+        unsup_fraction=args.unsup_fraction
+    )
 
     # Load Plain Network
     if args.resume:
@@ -389,14 +404,14 @@ def main_worker(rank, ngpus_per_node=ngpus_per_node):
         optimizer, 
         base_lr=0, 
         max_lr=args.learning_rate,
-        step_size_up=5 * len(trainloader),
-        step_size_down=(args.epoch - 5) * len(trainloader)
+        step_size_up=5 * (len(trainloader) + len(trainloader)),
+        step_size_down=(args.epoch - 5) * (len(trainloader) + len(trainloader))
     )
 
     # training and testing
     for epoch in range(args.epoch):
         rprint('\nEpoch: %d' % epoch, rank)
-        train(ensemble, ema_ensemble, trainloader, optimizer, lr_scheduler, scaler, attack)
+        train(ensemble, ema_ensemble, trainloader, auxloader, optimizer, lr_scheduler, scaler, attack)
         if args.EMA:
             test(ema_ensemble, testloader, attack, rank)
         else:
@@ -406,6 +421,9 @@ def main_worker(rank, ngpus_per_node=ngpus_per_node):
     dist.destroy_process_group()
 
 def run():
+    checkpoint_path = os.path.join(CHECKPOINT_PATH, args.dataset)
+    if not os.path.exists(checkpoint_path):
+        os.makedirs(checkpoint_path)
     torch.multiprocessing.spawn(main_worker, nprocs=ngpus_per_node, join=True)
 
 if __name__ == '__main__':
