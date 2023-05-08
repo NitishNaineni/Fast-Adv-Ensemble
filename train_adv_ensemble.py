@@ -44,7 +44,7 @@ torch.set_flush_denormal(True)
 parser = argparse.ArgumentParser()
 
 # Model parameters
-parser.add_argument('--dataset', default='cifar100', type=str)
+parser.add_argument('--dataset', default='cifar10', type=str)
 parser.add_argument('--network', default='resnet', type=str)
 parser.add_argument('--depth', default=18, type=int)
 parser.add_argument('--num_models', default=3, type=int)
@@ -55,7 +55,7 @@ parser.add_argument('--resume', default=False, type=bool)
 # Learning parameters
 parser.add_argument('--learning_rate', default=0.1, type=float)
 parser.add_argument('--weight_decay', default=0.0002, type=float)
-parser.add_argument('--batch_size', default=128, type=float)
+parser.add_argument('--batch_size', default=512, type=float)
 parser.add_argument('--test_batch_size', default=256, type=float)
 parser.add_argument('--epoch', default=10, type=int)
 parser.add_argument('--unsup_fraction', default=0.7, type=float)
@@ -404,8 +404,8 @@ def main_worker(rank, ngpus_per_node=ngpus_per_node):
         optimizer, 
         base_lr=0, 
         max_lr=args.learning_rate,
-        step_size_up=5 * (len(trainloader) + len(trainloader)),
-        step_size_down=(args.epoch - 5) * (len(trainloader) + len(trainloader))
+        step_size_up=5 * len(trainloader),
+        step_size_down=(args.epoch - 5) * len(trainloader)
     )
 
     # training and testing
