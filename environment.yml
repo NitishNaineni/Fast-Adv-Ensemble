@@ -19,8 +19,8 @@ dependencies:
   - matplotlib 
   - scipy=1.7.3
   - jupyterlab
+  - wget
   - pip
-  - matplotlib
   - tqdm
   - pip:
       - install 
