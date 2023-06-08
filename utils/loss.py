@@ -91,27 +91,24 @@ def trades_loss(inputs, adv_inputs, targets, ensemble, beta, lamda, log_det_lamd
     """
 
     # Concatenate the natural and adversarial inputs and targets
-    stacked_inputs = torch.cat([inputs, adv_inputs], dim=0)
-    stacked_targets = torch.cat([targets, targets], dim=0)
+    # stacked_inputs = torch.cat([inputs, adv_inputs], dim=0)
+    # stacked_targets = torch.cat([targets, targets], dim=0)
 
     # Calculate the ADP loss for the concatenated inputs and targets
-    combined_loss, combined_outputs = adp_loss(
-        stacked_inputs,
-        stacked_targets,
+    std_loss, adv_outputs = adp_loss(
+        adv_inputs,
+        targets,
         ensemble,
         lamda=lamda,
         log_det_lamda=log_det_lamda,
         num_classes=num_classes,
         label_smoothing=label_smoothing
     )
-
-    # Split the combined softmax outputs into natural and adversarial outputs
-    nat_outputs = combined_outputs[:inputs.size(0), :]
-    adv_outputs = combined_outputs[inputs.size(0):, :]
+    nat_outputs = ensemble(inputs)
 
     # Calculate the KL divergence between the adversarial and natural output probabilities
     robust_loss = F.kl_div(adv_outputs, nat_outputs, reduction='batchmean', log_target=True)
     # Calculate the TRADES loss
-    loss = combined_loss + beta * robust_loss
+    loss = std_loss + beta * robust_loss
 
     return loss, nat_outputs, adv_outputs
